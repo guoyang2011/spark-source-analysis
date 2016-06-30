@@ -1,0 +1,29 @@
+---
+date: 2016-06-12 14:05
+status: public
+title: Job提交流程
+---
+
+1. RDD.foreach(f:T=>Unit):Unit
+2. sc.runJob(rdd,(it:Iterator[T])=>iterator.foreach(f))
+3. sc.runJob[T,U:ClassTag](rdd:RDD[T],func:Iterator[T]=>U):Array[U]
+4. sc.runJob[T,U:ClassTag](rdd:RDD[T],func:Iterator[T]=>U,partition:Seq[Int]):Array[U]
+5. sc.runJob[T,U:ClassTag](rdd:RDD[T],func:(TaskContext,Iterator[T]=>U,partitions:Seq[Int]):Array[U]
+6. sc.runJob[T,U:ClassTag](rdd:RDD[T],func:(TaskContext,Iterator[T]=>U,partitions:Seq[Int],resultHandler:(Int,U)=>Unit):Array[U]
+7. dagScheduler.runJob[T,U](rdd:RDD[T],func:(TaskContext,Iterator[T])=>U,partition:Seq[Int],resultHandler:(Int,U)=>Unit,properties:Properties):Unit
+8. dagScheduler.submitJob[T,U](rdd:RDD[T],func:(TaskContext,Iterator[T])=>U,partitions:Seq[Int],callSite:CallSite,resultHandler:(Int,U)=>Unit,properties:Properties):JobWaiter[U]
+9. dagScheduler.eventProcessLoop.post(JobSubmitted(jobId:Int,finalRDD:RDD[_],func:(TaskContext,Iterator[_])=>_,partitions:Array[Int],callSite:CallSite,listener:JobListener,properties:Properties))
+10. dagScheduler.handleJobSubmitted(jobId:Int,finalRDD:RDD[_],func:(TaskContext,Iterator[_])=>_,partitions:Array[Int],callSite:CallSite,listener:JobListener,properties:Properties)
+11. dagScheduler.newResultStage(rdd:RDD[_],func:(TaskContext,Iterator[_])=>_,partitions:Array[Int],jobId:Int,callSite:CallSie):ResultStage
+11.1 dagScheduler.getParentStages(rdd:RDD[_],firstJobId:Int):List[Stage]
+11.2 dagSchduler.getShuffleMapStage(shuffleDep:ShuffleDependency[_,_,_],firstJobId:Int):ShuffleMapStage
+11.3 dagScheduler.getAncestorShuffleDependencies()
+11.4 dagScheduler.newShuffleMapStage(rdd:RDD[_],numTasks:Int,shuffleDep:ShuffleDependency[_,_,_],firstJobId:Int,callSite:CallSite):ShuffleMapStage
+12. dagScheduler.submitStage(stage:Stage)
+13. dagScheduler.submitMissingTasks(stage:Stage,jobId:Int)
+14. taskScheduler.submitTasks(TaskSet(tasks:Array[Task[_]],stageId:Int,stageAttemptId:Int,priority:Int,properties:Properties))
+15. taskScheduler.createTaskSetManager(taskSet:TaskSet,maxTaskFailures:Int):TaskSetManager
+
+
+
+

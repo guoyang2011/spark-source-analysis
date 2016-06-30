@@ -1,0 +1,167 @@
+---
+date: 2016-04-18 14:21
+status: public
+title: SCALA闭包总结
+---
+
+闭包定义形式：
+1. object中创建闭包
+2. class中创建闭包
+3. 函数中创建闭包
+spark中闭包处理的目的：
+1. 检查闭包函数中使用对象的序列问题，
+2. 清除闭包中引用对象中没有使用到的属性值，提高网络传输效率
+
+
+###闭包定义
+```scala
+val testF=(partition:Int,idx:Int)=>{//TODO}
+1.编译器生成默认只有一个参数的构造函数，参数类型为外部类类型
+2.生成apply方法，参数类型为Int,Int
+```
+###闭包初始化
+初始化在外部类初始化对象的时候会进行初始化
+1. 在外部类构造器函数中会调用闭包的构造器，将外部类的引用作为闭包构造器的参数进行初始化
+
+###闭包使用
+```scala
+testF(partition=5,idx=1)
+其实是调用闭包class文件中的apply方法
+```
+
+>所有method局部变量数组中数组中第一个局部变量指向方法所属对象的引用(this指针)
+scala中所有闭包（函数形式)经过scala编译器编译后会生成的class文件，其实是一个匿名内部类，生成的classw文件中包好默认的3个方法，一个参数为外部类类型的构造函数，一个apply方法，参数为在外部类中声明的参数，方法体为所有在{}之间的代码段。在调用闭包时系统会自动传递外部类索引初始化闭包（匿名内部类）；当闭包函数中调用外部类中的方法(scala中对属性的读写其实是通过getter和setter函数实现，不能直接访问属性)，闭包编译后生成的class文件中包含一个$outer属性变量指向外部类，如果没有调用外部类中的方法则没有指向外部类的属性$outer。
+>
+
+（Int,Int)=>{
+}//body中定义的所有代码都是在apply调用
+
+```scala
+class UserHandler{
+  var bean:String=""
+  val testF1=(idx:Int)=>{
+    val innerF=(idx1:Int,str:String)=>{
+      idx1+str
+    }
+    innerF(idx,bean)
+  }
+  val testF2=(idx1:String,f:Int=>String)=>{
+    idx1+f(1)
+  }
+  val testF3=(idx:String)=>{
+    //TODO
+  }
+}
+public final class org.apache.spark.UserHandler$$anonfun$1 extends scala.runtime.AbstractFunction1<java.lang.Object, java.lang.String> implements scala.Serializable {
+  public static final long serialVersionUID;
+
+  public final java.lang.String apply(int);
+    Code:
+       0: new           #23                 // class org/apache/spark/UserHandler$$anonfun$1$$anonfun$2
+       3: dup
+       4: aload_0
+       5: invokespecial #26                 // Method org/apache/spark/UserHandler$$anonfun$1$$anonfun$2."<init>":(Lorg/apache/spark/UserHandler$$anonfun$1;)V
+       8: astore_2
+       9: aload_2
+      10: iload_1
+      11: invokestatic  #32                 // Method scala/runtime/BoxesRunTime.boxToInteger:(I)Ljava/lang/Integer;
+      14: aload_0
+      15: getfield      #34                 // Field $outer:Lorg/apache/spark/UserHandler;
+      18: invokevirtual #38                 // Method org/apache/spark/UserHandler.bean:()Ljava/lang/String;
+      21: invokeinterface #43,  3           // InterfaceMethod scala/Function2.apply:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+      26: checkcast     #45                 // class java/lang/String
+      29: areturn
+
+  public final java.lang.Object apply(java.lang.Object);
+    Code:
+       0: aload_0
+       1: aload_1
+       2: invokestatic  #56                 // Method scala/runtime/BoxesRunTime.unboxToInt:(Ljava/lang/Object;)I
+       5: invokevirtual #58                 // Method apply:(I)Ljava/lang/String;
+       8: areturn
+
+  public org.apache.spark.UserHandler$$anonfun$1(org.apache.spark.UserHandler);
+    Code:
+       0: aload_1
+       1: ifnonnull     12
+       4: new           #63                 // class java/lang/NullPointerException
+       7: dup
+       8: invokespecial #64                 // Method java/lang/NullPointerException."<init>":()V
+      11: athrow
+      12: aload_0
+      13: aload_1
+      14: putfield      #34                 // Field $outer:Lorg/apache/spark/UserHandler;
+      17: aload_0
+      18: invokespecial #65                 // Method scala/runtime/AbstractFunction1."<init>":()V
+      21: return
+}
+
+
+public class org.apache.spark.UserHandler {
+  public java.lang.String bean();
+    Code:
+       0: aload_0
+       1: getfield      #21                 // Field bean:Ljava/lang/String;
+       4: areturn
+
+  public void bean_$eq(java.lang.String);
+    Code:
+       0: aload_0
+       1: aload_1
+       2: putfield      #21                 // Field bean:Ljava/lang/String;
+       5: return
+
+  public scala.Function1<java.lang.Object, java.lang.String> testF1();
+    Code:
+       0: aload_0
+       1: getfield      #29                 // Field testF1:Lscala/Function1;
+       4: areturn
+
+  public scala.Function2<java.lang.String, scala.Function1<java.lang.Object, java.lang.String>, java.lang.String> testF2();
+    Code:
+       0: aload_0
+       1: getfield      #32                 // Field testF2:Lscala/Function2;
+       4: areturn
+
+  public scala.Function1<java.lang.String, scala.runtime.BoxedUnit> testF3();
+    Code:
+       0: aload_0
+       1: getfield      #34                 // Field testF3:Lscala/Function1;
+       4: areturn
+
+  public org.apache.spark.UserHandler();
+    Code:
+       0: aload_0
+       1: invokespecial #38                 // Method java/lang/Object."<init>":()V
+       4: aload_0
+       5: ldc           #40                 // String
+       7: putfield      #21                 // Field bean:Ljava/lang/String;//初始化bean
+      10: aload_0
+      11: new           #42                 // class org/apache/spark/UserHandler$$anonfun$1
+      14: dup
+      15: aload_0
+      16: invokespecial #45                 // Method org/apache/spark/UserHandler$$anonfun$1."<init>":(Lorg/apache/spark/UserHandler;)V
+      19: putfield      #29                 // Field testF1:Lscala/Function1;
+      22: aload_0
+      23: new           #47                 // class org/apache/spark/UserHandler$$anonfun$3
+      26: dup
+      27: aload_0
+      28: invokespecial #48                 // Method org/apache/spark/UserHandler$$anonfun$3."<init>":(Lorg/apache/spark/UserHandler;)V
+      31: putfield      #32                 // Field testF2:Lscala/Function2;
+      34: aload_0
+      35: new           #50                 // class org/apache/spark/UserHandler$$anonfun$4
+      38: dup
+      39: aload_0
+      40: invokespecial #51                 // Method org/apache/spark/UserHandler$$anonfun$4."<init>":(Lorg/apache/spark/UserHandler;)V
+      43: putfield      #34                 // Field testF3:Lscala/Function1;
+      46: return
+}
+
+```
+
+------
+
+>作者:[快鸟2016](https://fastbird2016.farbox.com)
+邮箱:<fastbird2016@gmail.com>
+更新时间：2016年04月14日
+>

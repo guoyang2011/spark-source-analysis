@@ -1,0 +1,7 @@
+---
+date: 2016-04-28 16:24
+status: public
+title: ShuffleMapTask计算结果的保存与读取
+---
+
+[ShuffleMapTask结算结果的保存与读取](http://www.cnblogs.com/hseagle/p/3863966.html)

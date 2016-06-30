@@ -1,0 +1,35 @@
+---
+date: 2016-06-12 10:15
+status: public
+title: MapOutputTracker
+---
+
+#MapOutputTracker
+
+------
+##MapoutputTrackerMaster
+
+------
+##MapOutputTrackerWorker
+
+
+------
+#ShuffleManager
+重要接口
+class BaseShuffleHandle[K,V,C](shuffleId:Int,numMaps:Int,dependency:ShuffleDependency[K,V,C])
+class BlockStoreShufflerReader[K,C](handle:BaseShuffleHandle[K,_,C],startPartition:Int,endPartition:Int,context:TaskContext,blockManager:BlockManager=SparkEnv.get.blockManager,mapOutputTracker:MapOutputTracker=SparkEnv.get.mapOutputTracker)
+class HashShuffleWriter[K,V](shufflerBlockResolver:FileShufflerBlockResolver,handler:BaseShufflerHandle[K,V,_],mapId:Int,context:TaskContext)
+1. def registerShuffle[K,V,C](shuffleId:Int,numMaps:Int,dependency:ShuffleDependency[K,V,C]):ShuffleHandler
+2. def getReader[K,C](handle:ShuffleHandle,startPartition:Int,endPartition:Int,context:TaskContext):ShuffleReader[K,C]
+3. def getWriter[K,V](handle:ShuffleHandle,mapId:Int,context:TaskContext):ShuffleWriter[K,V]
+˙##HashShuffleManager
+
+##SortShuffleManager
+val newValue:V=entry._2
+val update:(Boolean,V)=>V=(hasValue:Boolean,OldValue:C){
+    if(hasValue) mergeValue(oldValue,newValue) else createCombiner(newValue)
+}
+createCombiner:V=>C
+mergeValue:(C,V)=>C
+mergeCombiner:(C,C)=>C
+new Aggregator[K,V,C](createCombiner,mergeValue,mergeCombiner)

@@ -1,0 +1,61 @@
+---
+date: 2016-05-27 14:33
+status: public
+title: streaming执行过程
+---
+
+#Streaming中执行相关的组件
+##StreamingContext
+##DStream
+###Operation
+- map:MappedDStream
+- filter:FilteredDStream
+- flatMap:FlatMapedDStream
+- repartition:TransformedDStream
+- union:UnionDStream
+- count:DStreamm[Long]
+- reduce:ShuffledDStream
+- countByValue
+- reduceByKey
+- groupByKey
+- join
+- cogroup
+- transform
+- updateStateByKey
+- print
+- foreachRDD
+- saveAsTextFiles
+- saveAsObjectFiles
+- saveAsHadoopFiles 
+
+
+### Type DStream
+**1.** InputDStream
+**1.1.** ReceiverInputStream
+***Receiver***
+**1.1.1** MQTTInputDStream
+**1.1.2** TwitterInputDStream
+**1.1.3** RawInputDStream
+**1.1.4** KafkaInputDStream
+**1.1.5** FlumePollingInputDStream
+**1.1.6** SocketInputDStream
+**1.2** CheckpointInputDStream
+**1.3** FileInputDStream
+**1.4** ConstantInputDStream
+**1.5** QueueInputDStream
+**2.**  MapPartitionedDStream
+**3.** UnionDStream
+**4.** MapValuedDStream
+**5.** FlatMapValuedDStream
+**6.** TransformedDStream
+**7.** FlatMappedDStream
+**8.** GlommedDStream
+**9.** DummyDStream
+**10.** ShuffledDStream
+**11.** StateDStream
+**12.** MapWithStateDStream
+**13.** InternalMapWithStateDStream
+**14.** ForEachDStream
+## JobScheduler 
+## JobGenerator
+## DStreamGraph

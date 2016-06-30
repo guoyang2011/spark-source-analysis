@@ -1,0 +1,168 @@
+---
+date: 2016-06-03 15:35
+status: public
+title: spark-streaming任务调度JobScheduler/JobGenerator
+---
+
+##两种类型消息
+1. 创建Job的消息由JobGenerator管理，与Job的创建过程相关
+```scala
+private[scheduler] sealed trait JobGeneratorEvent
+private[scheduler] case class GenerateJobs(time: Time) extends JobGeneratorEvent
+private[scheduler] case class ClearMetadata(time: Time) extends JobGeneratorEvent
+private[scheduler] case class DoCheckpoint(time: Time, clearCheckpointDataLater: Boolean) extends JobGeneratorEvent
+private[scheduler] case class ClearCheckpointData(time: Time) extends JobGeneratorEvent
+```
+2. Job执行的消息由JobScheduler管理，与Job的执行过程相关
+```scala
+private[scheduler] sealed trait JobSchedulerEvent
+private[scheduler] case class JobStarted(job: Job, startTime: Long) extends JobSchedulerEvent
+private[scheduler] case class JobCompleted(job: Job, completedTime: Long) extends JobSchedulerEvent
+private[scheduler] case class ErrorReported(msg: String, e: Throwable) extends JobSchedulerEvent
+```
+##两个批处理时间
+#JobScheduler
+## 职责
+1. 管理所有根据批处理时间生成Job的状态
+2. 为每个Job创建JobHandler执行
+3. 创建JobGenerator根据批处理时间定时生成JobSet
+4. 创建ReceiverTracker在Driver端管理所有的StreamingContext.start()之前注册的所有ReceiverInputDstream，
+##两个组件
+1. ReceiverTracker Driver端管理所有在StreamingContext.start()执行之前注册的所有ReceiverInputDStream输入流中定义的Receiver，创建接收数据ParallelCollectionRDD[Receiver[_]],并提交ParallelCollectionRDD到Worker端执行连续接收数据的任务，同时管理Receiver的生命周期
+
+###在Worker端执行的核心逻辑:
+启动ReceiverSupervisorImpl管理Receiver,按照Receiver.onStart()中定义的接收数据逻辑接收数据，并通过Receiver.store()接口将数据同步储存到BlockGenerator的临时数组arrayBuffer中，BlockGenerator启动blockIntervalTimer定时器，按照spark.streaming.blockInterval设置的批处理时间定时（默认时间为200ms）获取arrayBUffer中所有已经接受到的临时数据,生成临时的Block(StreamBlockId,ArrayBuffer[Any])，并将生成的临时block保存到BlockGenerator.blocksForPushing队列中，最后在BlockGenerator中启动blockPushingThread线程,顺序的将blocksForPushing队列中的所有block通过ReceivedBlockHandler提供的storeBlock(blockId:StreamBlockId,block:ReceivedBlock)接口，保存到Worker端的BlockManager中，并将block的存储信息通知driver端的BlockManagerMaster。
+>###涉及组件:
+**1.** ReceiverSupervisorImpl: 管理Worker端Receiver的生命周期
+**2.** ReceiverBlockTracker:
+**3.** Receiver：通过onStart中实现的方式循环接收数据源中的数据(pull/push)
+**4.** BlockGenerator: 将Receiver中接收到的连续数据按照spark.streaming.blockInterval 定义的批处理时间拆分成block，并储存到队列中等待被存储到BlockManager
+**5.** ReceivedBlockHandler: 将BlockGenerator中生成的Block存储到BlockManager中
+>
+
+在Worker端启动Receiver核心代码
+```scala
+private def startReceiver(
+        receiver: Receiver[_],
+        scheduledLocations: Seq[TaskLocation]): Unit = {
+      def shouldStartReceiver: Boolean = {
+        // It's okay to start when trackerState is Initialized or Started
+        !(isTrackerStopping || isTrackerStopped)
+      }
+
+      val receiverId = receiver.streamId
+      if (!shouldStartReceiver) {
+        onReceiverJobFinish(receiverId)
+        return
+      }
+
+      val checkpointDirOption = Option(ssc.checkpointDir)
+      val serializableHadoopConf =
+        new SerializableConfiguration(ssc.sparkContext.hadoopConfiguration)
+
+      // Function to start the receiver on the worker node
+      //在Worker端执行的接受数据的核心逻辑
+      val startReceiverFunc: Iterator[Receiver[_]] => Unit =
+        (iterator: Iterator[Receiver[_]]) => {
+          if (!iterator.hasNext) {
+            throw new SparkException(
+              "Could not start receiver as object not found.")
+          }
+          if (TaskContext.get().attemptNumber() == 0) {
+            val receiver = iterator.next()
+            assert(iterator.hasNext == false)
+            val supervisor = new ReceiverSupervisorImpl(
+              receiver, SparkEnv.get, serializableHadoopConf.value, checkpointDirOption)
+            supervisor.start()
+            supervisor.awaitTermination()
+          } else {
+            // It's restarted by TaskScheduler, but we want to reschedule it again. So exit it.
+          }
+        }
+
+      // Create the RDD using the scheduledLocations to run the receiver in a Spark job
+      //根据ReceiverInputDStream中设置的位置偏好，创建接受数据的输入流RDD
+      val receiverRDD: RDD[Receiver[_]] =
+        if (scheduledLocations.isEmpty) {
+          ssc.sc.makeRDD(Seq(receiver), 1)
+        } else {
+          val preferredLocations = scheduledLocations.map(_.toString).distinct
+          ssc.sc.makeRDD(Seq(receiver -> preferredLocations))
+        }
+      receiverRDD.setName(s"Receiver $receiverId")
+      ssc.sparkContext.setJobDescription(s"Streaming job running receiver $receiverId")
+      ssc.sparkContext.setCallSite(Option(ssc.getStartSite()).getOrElse(Utils.getCallSite()))
+
+     //创建提交RDD
+      val future = ssc.sparkContext.submitJob[Receiver[_], Unit, Unit](
+        receiverRDD, startReceiverFunc, Seq(0), (_, _) => Unit, ())
+      // We will keep restarting the receiver job until ReceiverTracker is stopped
+      future.onComplete {
+        case Success(_) =>
+          if (!shouldStartReceiver) {
+            onReceiverJobFinish(receiverId)
+          } else {
+            logInfo(s"Restarting Receiver $receiverId")
+            self.send(RestartReceiver(receiver))
+          }
+        case Failure(e) =>
+          if (!shouldStartReceiver) {
+            onReceiverJobFinish(receiverId)
+          } else {
+            logError("Receiver has been stopped. Try to restart it.", e)
+            logInfo(s"Restarting Receiver $receiverId")
+            self.send(RestartReceiver(receiver))
+          }
+      }(submitJobThreadPool)
+      logInfo(s"Receiver ${receiver.streamId} started")
+    }
+```
+###重要组件
+- ReceiverSupervisorImpl
+- BlockGenerator
+2. JobGanarator 根据设置的批处理时间batchTime,定时获取所有当前所有Receiver已经接受到的Block,并生成当前时间片的批处理任务
+#JobGenerator的功能
+1. 创建Timer定时器，从启动开始定时产生创建的Job的请求
+2. 产生新的Job后向JobScheduler
+核心逻辑
+```scala
+private def triggerActionForNextInterval(): Unit = {
+    clock.waitTillTime(nextTime)
+    callback(nextTime)
+    prevTime = nextTime
+    nextTime += period
+    logDebug("Callback for " + name + " called at time " + prevTime)
+  }
+//定时向JobGenerator中的消息处理单元EventLoop发送创建任务的请求GenerateJobs
+val callback:(Long)=>Unit= (longTime) => eventLoop.post(GenerateJobs(new Time(longTime)))
+```
+2. 创建Job相关的消息处理器，接受Timer产生的创建Job的消息请求，核心逻辑
+```scala
+private def processEvent(event: JobGeneratorEvent) {
+    logDebug("Got event " + event)
+    event match {
+      case GenerateJobs(time) => generateJobs(time)
+      case ClearMetadata(time) => clearMetadata(time)
+      case DoCheckpoint(time, clearCheckpointDataLater) =>
+        doCheckpoint(time, clearCheckpointDataLater)
+      case ClearCheckpointData(time) => clearCheckpointData(time)
+    }
+  }
+//获取当前JobGenerator所有输入流中已经产生的Block信息，生成Job信息
+private def generateJobs(time: Time) {
+    // Set the SparkEnv in this thread, so that job generation code can access the environment
+    // Example: BlockRDDs are created in this thread, and it needs to access BlockManager
+    // Update: This is probably redundant after threadlocal stuff in SparkEnv has been removed.
+    SparkEnv.set(ssc.env)
+    Try {
+      jobScheduler.receiverTracker.allocateBlocksToBatch(time) // allocate received blocks to batch
+      graph.generateJobs(time) // generate jobs using allocated block
+    } match {
+      case Success(jobs) =>
+        val streamIdToInputInfos = jobScheduler.inputInfoTracker.getInfo(time)
+        jobScheduler.submitJobSet(JobSet(time, jobs, streamIdToInputInfos))
+      case Failure(e) =>
+        jobScheduler.reportError("Error generating jobs for time " + time, e)
+    }
+    eventLoop.post(DoCheckpoint(time, clearCheckpointDataLater = false))
+  }

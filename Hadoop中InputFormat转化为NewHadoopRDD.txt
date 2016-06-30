@@ -1,0 +1,213 @@
+---
+date: 2016-04-25 13:52
+status: draft
+title: Hadoop中InputFormat转化为NewHadoopRDD
+---
+
+Hadoop文件相关结构
+```scala
+//hdfs文件存储的信息，包括文件分块信息(集群中的块存储和副本存储位置，块在文件中的起始位置，块大小等)，文件路径，文件大小，访问权限(同POXIS权限，用户-组-其他)，文件副本数，单个文件块大小，最近访问和修改文件的时间，文件所属的用户和组，文件是否是文件夹类型，文件是否是linked文件
+case class LocalFileStatus(locations:Array[BlockLocation]) extends FileStatus(path:Path,length:Long,isDir:Boolean,block_replication:short,blockSize:Long,modification_time:Long,access_time:Long,permission:FsPermission,owner:String,group:String,symlink:Path)
+case class BlockLocation(hosts:Array[String],cachedHosts:Array[String],names:Array[String],offset:Long,length:Long,corrupt:boolean)
+case class FileSplit(path:Path,start:Long,length:Long,hosts:Array[String],hostInfos:Array[SplitLocationInfo]) extends InputSplit with Writable
+```
+Hadoop中**MapReduce**计算使用**InputFormat**来抽象输入记录数据，对于不同的输入源使用不同的**InputFormat**和不同的**RecordReader**实现方式，**InputFormat**主要功能：
+1. 验证输入的规范.
+2. 将输入的记录数据通过分片拆分成逻辑上的计算单元.
+3. 提供输入源中记录的读取方式**RecordReader**的实现.
+hadoop 2.7.2中**InputFormat**主要实现类包括***CombineFileInputFormat,CombineSequenceFileInputFormat,CombineTextInputFormat,CompositeInputFormat,DBInputFormat,FileInputFormat,FixedLengthInputFormat,KeyValueTextInputFormat,MultiFileInputFormat,NLineInputFormat,Parser.Node,SequenceFileAsBinaryInputFormat,SequenceFileAsTextInputFormat,SequenceFileInputFilter,SequenceFileInputFormat,TextInputFormat***
+```scala
+/** 
+ * <code>InputFormat</code> describes the input-specification for a 
+ * Map-Reduce job. 
+ * 
+ * <p>The Map-Reduce framework relies on the <code>InputFormat</code> of the
+ * job to:<p>
+ * <ol>
+ *   <li>
+ *   Validate the input-specification of the job. 
+ *   <li>
+ *   Split-up the input file(s) into logical {@link InputSplit}s, each of 
+ *   which is then assigned to an individual {@link Mapper}.
+ *   </li>
+ *   <li>
+ *   Provide the {@link RecordReader} implementation to be used to glean
+ *   input records from the logical <code>InputSplit</code> for processing by 
+ *   the {@link Mapper}.
+ *   </li>
+ * </ol>
+ * 
+ * <p>The default behavior of file-based {@link InputFormat}s, typically 
+ * sub-classes of {@link FileInputFormat}, is to split the 
+ * input into <i>logical</i> {@link InputSplit}s based on the total size, in 
+ * bytes, of the input files. However, the {@link FileSystem} blocksize of  
+ * the input files is treated as an upper bound for input splits. A lower bound 
+ * on the split size can be set via 
+ * <a href="{@docRoot}/../hadoop-mapreduce-client/hadoop-mapreduce-client-core/mapred-default.xml#mapreduce.input.fileinputformat.split.minsize">
+ * mapreduce.input.fileinputformat.split.minsize</a>.</p>
+ * 
+ * <p>Clearly, logical splits based on input-size is insufficient for many 
+ * applications since record boundaries are to respected. In such cases, the
+ * application has to also implement a {@link RecordReader} on whom lies the
+ * responsibility to respect record-boundaries and present a record-oriented
+ * view of the logical <code>InputSplit</code> to the individual task.
+ *
+ * @see InputSplit
+ * @see RecordReader
+ * @see FileInputFormat
+ */
+@InterfaceAudience.Public
+@InterfaceStability.Stable
+public abstract class InputFormat<K, V> {
+
+  /** 
+   * Logically split the set of input files for the job.  
+   * 
+   * <p>Each {@link InputSplit} is then assigned to an individual {@link Mapper}
+   * for processing.</p>
+   *
+   * <p><i>Note</i>: The split is a <i>logical</i> split of the inputs and the
+   * input files are not physically split into chunks. For e.g. a split could
+   * be <i>&lt;input-file-path, start, offset&gt;</i> tuple. The InputFormat
+   * also creates the {@link RecordReader} to read the {@link InputSplit}.
+   * 
+   * @param context job configuration.
+   * @return an array of {@link InputSplit}s for the job.
+   */
+  public abstract 
+    List<InputSplit> getSplits(JobContext context
+                               ) throws IOException, InterruptedException;
+  
+  /**
+   * Create a record reader for a given split. The framework will call
+   * {@link RecordReader#initialize(InputSplit, TaskAttemptContext)} before
+   * the split is used.
+   * @param split the split to be read
+   * @param context the information about the task
+   * @return a new record reader
+   * @throws IOException
+   * @throws InterruptedException
+   */
+  public abstract 
+    RecordReader<K,V> createRecordReader(InputSplit split,
+                                         TaskAttemptContext context
+                                        ) throws IOException, 
+                                                 InterruptedException;
+
+}
+```
+InputSplit接口 
+```java
+/**
+   * Get the total number of bytes in the data of the <code>InputSplit</code>.
+   * 
+   * @return the number of bytes in the input split.
+   * @throws IOException
+   */
+  long getLength() throws IOException;
+  
+  /**
+   * Get the list of hostnames where the input split is located.
+   * 
+   * @return list of hostnames where data of the <code>InputSplit</code> is
+   *         located as an array of <code>String</code>s.
+   * @throws IOException
+   */
+  String[] getLocations() throws IOException;
+```
+RecordReader接口 Hadoop中单条记录数据读取的抽象，文件中记录的存取方式决定文件的读取方式，如文件中记录采用按行存储，按固定长度，按数据库，顺序文件，Key-Value键值对等方式存储，那么在读取记录时应该使用相应的RecordReader实现读取，如实现方式包括按行使用**LineRecordReader**，按固定长度使用**FixedLengthRecordReader**，按Key-value方式使用**KeyValueLineRecordReader**方式读取块(分片)中记录数据。
+hadoop 2.7.2中**RecordReader**主要实现类***CombineFileRecordReader,CombineFileRecordReaderWrapper,InnerJoinRecordReader,KeyValueLineRecordReader,MultiFilterRecordReader,OuterJoinRecordReader,OverrideRecordReader,SequenceFileAsTextRecordReader,SequenceFileRecordReader,WrapperRecordReader***
+```java
+/**
+ * <code>RecordReader</code> reads &lt;key, value&gt; pairs from an 
+ * {@link InputSplit}.
+ *   
+ * <p><code>RecordReader</code>, typically, converts the byte-oriented view of 
+ * the input, provided by the <code>InputSplit</code>, and presents a 
+ * record-oriented view for the {@link Mapper} & {@link Reducer} tasks for 
+ * processing. It thus assumes the responsibility of processing record 
+ * boundaries and presenting the tasks with keys and values.</p>
+ * 
+ * @see InputSplit
+ * @see InputFormat
+ */
+@InterfaceAudience.Public
+@InterfaceStability.Stable
+public interface RecordReader<K, V> {
+  /** 
+   * Reads the next key/value pair from the input for processing.
+   *
+   * @param key the key to read data into
+   * @param value the value to read data into
+   * @return true iff a key/value was read, false if at EOF
+   */      
+  boolean next(K key, V value) throws IOException;
+  
+  /**
+   * Create an object of the appropriate type to be used as a key.
+   * 
+   * @return a new key object.
+   */
+  K createKey();
+  
+  /**
+   * Create an object of the appropriate type to be used as a value.
+   * 
+   * @return a new value object.
+   */
+  V createValue();
+
+  /** 
+   * Returns the current position in the input.
+   * 
+   * @return the current position in the input.
+   * @throws IOException
+   */
+  long getPos() throws IOException;
+
+  /** 
+   * Close this {@link InputSplit} to future operations.
+   * 
+   * @throws IOException
+   */ 
+  public void close() throws IOException;
+
+  /**
+   * How much of the input has the {@link RecordReader} consumed i.e.
+   * has been processed by?
+   * 
+   * @return progress from <code>0.0</code> to <code>1.0</code>.
+   * @throws IOException
+   */
+  float getProgress() throws IOException;
+}
+```
+Spark中RDD计算的接口
+```scala
+def getPartitions:Array[Partition];
+def compute(thisSplit:Partition,context:TaskContext):Iterator[T]
+```
+在NewHadoopRDD中**getPartitions**方法将Hadoop的**FileSplit**转化为RDD中可序列化的**NewHadoopPartition**
+```scala
+//key is RDDIds
+//value are arrays indexed by partition numbers,each array value is the set of locations where that RDD partition is cached
+type PartitionId=Long
+type RDDId=Long
+type PartitionIdToTaskLocation=(PartitionId,Seq[TaskLocation])//三种类型的TaskLocation,
+ 1. HostTaskLocation(host:String),
+ 2. HDFSCahceTaskLocation(host:String),
+ 3. ExecutorCacheTaskLocation(executorId:String,host:String)
+type RDDIdTOTaskLocation=(RDDId,Seq[PartitionIdToTaskLocation])
+val rddIdToTaskLocation=new HashMap[Int,IndexedSeq[Seq[TaskLocation]]]//一个RDD有多个partition，一个partition有多个TaskLocation
+//一个job有多个stage,一个stage有多个task,一个task对应一个executor,一个executor可以有多个task
+SchedulerBackend的类型：
+LocalBackend:本地模式的资源调度器
+MesosSchedulerBackend：使用mesos作为资源管理器的细粒度fine-grainted资源调度
+,CoarseGrainedSchedulerBackend
+```
+
+------
+>作者:[快鸟2016](https://fastbird2016.farbox.com)
+邮箱:<fastbird2016@gmail.com>
+更新时间：2016年04月14日
+>

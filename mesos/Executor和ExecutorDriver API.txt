@@ -1,0 +1,55 @@
+---
+date: 2016-05-06 14:44
+status: public
+title: Executor和ExecutorDriver API
+---
+
+#Mesos Executor API
+所有接口都是回调接口且同一时间只有一个接口被回调，在自定义Executor的时候每个回调接口尽量不要长时间阻塞，Mesos内部可能导致死锁。
+1. void registered(ExecutorDriver driver,ExecutorInfo executorInfo,FrameworkInfo frameworkInfo,SlaveInfo slaveInfo);
+当ExecutorDriver成功注册到Mesos时回调，会回传executor信息***ExecutorInfo***,框架信息***FrameworkInfo***和Slave节点信息***SlaveInfo***
+2. void reregistered(ExecutorDriver driver, SlaveInfo slaveInfo);
+当Slave节点重启，Executor重新注册成功时回调。
+3. void disconnected(ExecutorDriver driver);
+当Slave节点无法识别当前Executor时回调，可能原因为Slave节点因为升级重新启动后失去ExecutorDriver的连接
+4. void killTask(ExecutorDriver driver, TaskID taskId);
+当收到Mesos集群Framework端SchedulerDriver（Scheduler端通过调用SchedulerDriver.killTask接口）杀死任务事件时回调，需要在此回调接口中实现Executor中任务Id为taskId的操作，并更新Task的状态为Task_KILLED，发送给Scheduler端
+5. void frameworkMessage(ExecutorDriver driver, byte[] data);
+当收到framework发送的消息时回调，Mesos支持消息的语义为Fire-forget，不保证消息的可靠性。
+6. void shutdown(ExecutorDriver driver);
+当slave端收到Mesos决定shutdown当前Executor的消息后回调，在此接口中需要以同步的方式处理所有当前Executor中Task状态为Task_FINISHED或Task_KILLED
+7. void error(ExecutorDriver driver, String message);
+当Executor或ExecutorDriver发生致命错误时回调，driver会先于此方法终止，不能使用driver发送消息。
+
+------
+#Mesos ExecutorDriver
+作为Executor与Mesos的连接的桥梁，主要职责包括：1.管理Executor的生命周期(启动，停止或等待Executor结束);2.和Mesos进行交互(发送Executor中Task的状态更新和发送框架消息给Mesos)。默认实现为***MesosExecutorDriver***
+**1.** Status start();
+启动ExecutorDirver,必须在除了run接口之外的所有ExecutorDriver中方法调用之前执行。
+**2.** Status stop();
+暂停当前ExecutorDriver
+**3.** Status abort();
+终止当前ExecutorDriver，如果ExecutorDriver被终止，Executor将不会再收到回调消息。
+**4.** Status join();
+阻塞等待当前ExecutorDriver完成stop或abort事件，返回的Status可以检测ExecutorDriver是否已经被aborted
+**5.** Status run();
+用于启动当前ExecutorDriver,当启动失败后调用join接口立即进入阻塞等待
+MesosExecutorDriver中实现代码
+```scala
+ public Status run() {
+    Status status = start();
+    return status != Status.DRIVER_RUNNING ? status : join();
+  }
+```
+
+**6.** Status sendStatusUpdate(TaskStatus status);
+发送Task的更新状态给Mesos的Framework Scheduler,对于可靠消息需做At-Least-Once Delivery消息语义支持.
+**7.** Status sendFrameworkMessage(byte[] data);
+发送消息给Mesos中Framework Scheduler,消息语义为Fire-Forget,注意使用此接口发送的消息是不可靠的。
+
+------
+>作者:[快鸟2016](https://fastbird2016.farbox.com)
+邮箱:<fastbird2016@gmail.com>
+更新时间：2016年04月14日
+Mesos 版本：0.28.1
+>

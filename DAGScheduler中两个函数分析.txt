@@ -1,0 +1,41 @@
+---
+date: 2016-06-24 11:13
+status: public
+title: DAGScheduler中两个函数分析
+---
+
+```scala
+abstract class Stage(id:Int,rdd:RDD[_],numTasks:Int,parents:List[Stage],forstJobId:Int,callSite:CallSite)
+class ShuffleStage(id:Int,rdd:RDD[_],numTasks:Int,parents:List[Stage],firstJobId:Int,callSite:CallSite,shuffleDep:ShuffleDependency[_,_,_])
+private def getMissingParentStages(stage: Stage): List[Stage] = {
+    val missing = new HashSet[Stage]
+    val visited = new HashSet[RDD[_]]
+    // We are manually maintaining a stack here to prevent StackOverflowError
+    // caused by recursively visiting
+    val waitingForVisit = new Stack[RDD[_]]
+    def visit(rdd: RDD[_]) {
+      if (!visited(rdd)) {
+        visited += rdd
+        val rddHasUncachedPartitions = getCacheLocs(rdd).contains(Nil)
+        if (rddHasUncachedPartitions) {
+          for (dep <- rdd.dependencies) {
+            dep match {
+              case shufDep: ShuffleDependency[_, _, _] =>
+                val mapStage = getShuffleMapStage(shufDep, stage.firstJobId)
+                if (!mapStage.isAvailable) {
+                  missing += mapStage
+                }
+              case narrowDep: NarrowDependency[_] =>
+                waitingForVisit.push(narrowDep.rdd)
+            }
+          }
+        }
+      }
+    }
+    waitingForVisit.push(stage.rdd)
+    while (waitingForVisit.nonEmpty) {
+      visit(waitingForVisit.pop())
+    }
+    missing.toList
+  }
+```

@@ -1,0 +1,73 @@
+---
+date: 2016-06-08 10:27
+status: public
+title: Partition有感
+---
+
+```scala
+trait Partition extends Serializable{def index:Int}
+class NewHadoopPartition(rddId:Int,val index:Int,rawSplit:InputSplit with Writable)
+class JDBCPartition(whereClause:String,idx:Int) 
+class BlockRDDPartition(val blockId:BlockId,idx:Int)
+class ZippedWithIndexRDDPartition(prev:Partition,startIndex:Long)
+class UnionPartition[T:ClassTag](idx:Int,rdd:RDD[T],parentRDDIdx:Int,parentRDDPartitionIdx:Int) 
+class JdbcPartition(idx:Int,lower:Long,upper:Long) 
+class WriteAheadLogBackedBlockRDDPartition(index:Int,blockId:BlockId,isBlockIdValid:Boolean,walRecordHandler:WriteAheadLogRecordHandle)
+class RandomRDDPartition[T](index:Int,size:Int,generator:RandomDataGenerator[T],seed:Long) 
+class CoalescedRDDPartition(index:Int,parentsIndices:Array[Int],preferredLocation:Option[String])//聚合 Coalsesced
+
+class ParallelCollectionPartition[T:ClassTag](rddId:Int,slice:Int,values:Seq[T])
+class ParallelCollectionRDD[T:ClassTag](sc:SparkContext,data:Seq[T],numSlices:Int,localionPrefs:Map[Int,Seq[String]])
+
+class CartesianPartition(idx:Int,rdd1:RDD[_],rdd2:RDD[_],s1Index:Int,s2Index:Int)//cartesian笛卡尔积
+class ZippedPartitionsPartition(idx:Int,rdds:Seq[RDD[_]],preferredLocation:Seq[String])//将多个RDD聚合为一个RDD
+
+private[mllib] class SlidingRDDPartition[T](idx:Int,prev:Partition,tail:Seq[T],offset:Int)
+
+class PartitionerAwareUnionRDDPartition（rdds:Seq[RDD[_]],index:Int）//rdds.size>0，每个RDD都定义了Partitioner且类型相同的同一个分片对象（总分片数相同)
+public[streaming] class KafkaRDDPartition(index:Int,topic:String,partition:Int,fromOffset:Long,untilOffset:Long,host:String,port:Int)
+class PartitionwiseSampledRDDPartition(prev:Partition,seed:Long)//抽样获取分布式式数据集中的样本数据
+public[sql] class ShuffledRowRDDPartition(postShuffledPartitionIndex:Int,startPreShufflePartitionIndex:Int,endPreShufflePartitionIndex:Int)//index=postShuffledPartitionIndex
+
+class PartitionPruningRDDPartition(idx:Int,parentSplit:Partition)//删除特定分片（prune删除)
+class PartitionPruningRDD[T:ClassTag](prev:RDD[T],partitionFilterFunc:Int=>Boolean)
+class PruningDependency[T](rdd:RDD[T],partitionFunc:Int=>Boolean) extends NarrowDependency[T(rdd){
+val partitions:Array[Partition]=rdd.partitions.filter(s=>partitionFunc(s.index)).zipWithIndex.map{case (split,idx)=>new PartitionPruningRDDPartition(idx,split)}
+def getParents(partitionId:Int):List[Int]=List(partitions(partitionId).asInstanceOf[PartitionPruningRDDPartition].parentSplit.index)
+}
+class CheckpointRDDPartition
+
+
+class RangePartitioner[K:Ordering:ClassTag,V](partitions:Int,rdd:RDD[_<:Product2[K,V]],ascending:Boolean=true)
+
+class ShuffledRDDPartition(idx:int)
+class ShuffledRDD[K:ClassTag,V:ClassTag,C:ClassTag](prev:RDD[_<:Product2[K,V]],part:Partitioner) extends RDD[(K,C)]
+class ShuffleDependency[K:ClassTag,V:ClassTag,C:ClassTag](_rdd:RDD[_<:Product2[K,V]],partitioner:Partitioner:Partitioner,serializer:Option[Serializer],keyOrdering:Option[Ordering[K]],aggregator:Option[Aggregator[K,V,C]],mapSideCombine:Boolean)
+
+
+class HadoopPartition
+class MapWithStateRDDPartition
+class GoGroupPartition
+class FatPartition
+class CustomShuffledRDDPartition
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```

@@ -1,0 +1,10 @@
+---
+date: 2016-04-26 18:39
+status: public
+title: ShuffleManager
+---
+
+shuffle过程为重新组织数据有两种形式：
+1. rehash HashShuffleManager HashShuffleWriter
+2. resort sortShuffleManager SortShuffleWriter
+3. aggregrator 聚合数据

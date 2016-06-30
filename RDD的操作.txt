@@ -1,0 +1,13 @@
+---
+date: 2016-06-08 10:11
+status: public
+title: RDD的操作
+---
+
+```scala
+def persist():this.type
+def unpersit(blocking:Boolean=true):this.type
+def partitions:Array[Partition]
+def preferredLocations(slit:Partition):Seq[String]
+def getPreferredLocations(split:Partition):Seq[String]
+```

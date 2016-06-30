@@ -1,0 +1,9 @@
+---
+date: 2016-04-28 16:40
+status: public
+title: SparkContext
+---
+
+
+![](http://www.sxt.cn/editor/attached/image/20141005/42202719/c628e273-4db6-4709-b71b-d1bfee698390.jpg)
+注：[Spark技术内幕之任务调度：从SparkContext开始](http://www.sxt.cn/u/2521/blog/3822)

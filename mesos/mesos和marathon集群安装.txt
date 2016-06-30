@@ -1,0 +1,7 @@
+---
+date: 2016-05-12 14:56
+status: public
+title: mesos和marathon集群安装
+---
+
+1. [mesos和marathon集群安装](https://open.mesosphere.com/getting-started/install/#master-setup)

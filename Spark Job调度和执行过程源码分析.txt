@@ -1,0 +1,358 @@
+---
+date: 2016-05-06 13:13
+status: public
+title: Spark Job调度和执行过程源码分析
+---
+
+spark on mesos中job调度和执行过程如下图流程：
+![spark on mesos job scheduler](https://raw.githubusercontent.com/guoyang2011/spark-source-analysis/master/image/spark-job-scheduler-process-on-mesos.jpeg)
+spark中Job发生在RDD上执行Action操作，执行流程分为两部分
+1. Spark Driver端Job提交、Stage拆分、Task创建提交和等待所有Tasks、Stages完成及Job完成
+2. 集群中资源Slave节点上创建Executor中执行Spark Driver提交的Task、更新Task的执行状态并将Task执行结果返回SparkDriver
+
+------
+
+#spark driver中Job提交和Tasks创建
+**1** 通过配置不同数据源创建相应RDD(NewHadoopRDD,JDBCRDD,KafkaRDD等RDD)
+**2** 通过RDD中提供的transform接口(map,filter,groupByKey)执行RDDs转化操作
+**3** 执行RDD中提供的action接口(reduce,count,saveAsTextFile等)调用sc.runJob(...) 提交Job任务
+**4** dagScheduler.runJob(...) 根据RDD的依赖关系(NarrowDependency[OneToOneDependency,RangeDependency(union)],)将任务拆分成不同的stages(ShuffleMapStage,ResultStage)，包含一个或多个ShuffleMapStage和一个ResultStage
+**5** dagScheduler.submitJob(...)
+**5.1** 创建JobWaiter监听DAGScheduler.submitJob(...)创建的job执行状态，当执行完整后将每个task(RDD每个分片)的返回结果，调用resultHandler函数(resultHandler类型：**(Int,T)=>Unit**)进行相关操作，如输出到文件,打印结果或收集执行结果等操作
+**6** dagScheduler.eventProcessLoop.post(JobSubmitter(...)) 将新创建的job放到DAGSchedulerEventProcessLoop的消息队列中等待Job被执行,DAGSchedulerEventProcessLoop采用单线程串行处理DAGSchedulerEvent事件
+**7** dagScheduler.handleJobSubmitted(...) 当DAGSchedulerEventProcessLoop执行JobSubmitter事件时调用DAGScheduler.handleJobSUbmitted(...)处理job提交相关的操作,包括创建ResultStage,向Spark消息总线***LiveLinsterBus***发送Job开始消息***SparkListenerJobStart***,提交创建的ResultStage和等待所有stage执行完成
+**8** dagScheduler.submitStage(...) 提交ResultStage，并根据ResultStage中RDD的依赖关系反向遍历DAG图,以RDD中ShuffleDependency依赖关系为边界将DAG拆分成不同的ShufflMapStage,并顺序提交拆分后的ShuffleMapStage，最后提交ResultStage.一个job可能包含多个ShuffleMapStage.
+**8.1** dagScheduler.getMissingParentStages(...) 根据rdd根据依赖关系以ShuffleDependency依赖的RDD为边界，将DAG图拆分成为不同的stage,并返回拆分和创建的所有ShuffleMapStage,函数调用过程：如果RDD依赖关系为NarrayDependency则沿上遍历RDD,如果RDD依赖关系为ShuffleDependency则调用***dagScheduler.getShuffeMapStage(...)***获取如果缓存或者创建新的ShuffleMapStage,不存在调用***dagScheduler.newShuffleStage(...)***创建***ShuffleMapStage***
+**9** dagScheduler.submitMissingTasks(...) 提交DAG图拆分的所有stage(ShuffleMapStage，ResultStage),根据stage类型创建Tasks，taskBinary中存放序列化后的二进制信息，主要存储executor端调度task所需要的信息，包括rdd,依赖关系和分片上执行的转化操作，根据stage类型不同而不同。
+**9.1** 如果stage为ShuffeMapStage，创建的所有Task为ShuffleMapTask,taskBinary中序列化数据为***(stage.rdd, stage.shuffleDep): AnyRef***，每个task执行完后会将会返回MapStatus,并根据不同的分区器(HashPartitioner和RangePartitioner)将结果输出到本地文件，每个task本地文件的个数等于partitio的个数。从RDD角度看最终生成的文件数等于Task的数量*partition的数量.注意在Reducer端采用***ByteBuffer.allocate(Integer.MAX_SIZE)***存储接受到的mapper端数据，shuffle块的最大容量为2GB，如果shuffle块大小超过2GB将抛出OOM异常，主要调优对于使用RangePartitioner分片器RDD可以增加Reducer端分片数量降低每个分片shuffle block大小来解决，对于HashPartitioner分区器可能是RDD中key集中在某些key上导致分片不均匀，可以通过对key做二次hash的方式提高每个key在RDD中均匀性
+>MapStatus有两种实现：HighlyCompressedMapStatus和CompressedMapStatus
+当parition分区数大于2000个时ShuffleMapTask返回结果为**HighlyCompressedMapStatus**
+当partition分区数小于等于2000个是ShuffleMapTask返回结果为**CompressedMapStatus**
+
+>
+
+**9.2**  如果stage为ResultStage,创建的所有Task为ResultTask，执行完成后将结果返回***Driver***端，taskBinary中序列化数据为***(stage.rdd, stage.func): AnyRef***
+```scala
+private def submitMissingTasks(stage: Stage, jobId: Int) {
+    logDebug("submitMissingTasks(" + stage + ")")
+    // Get our pending tasks and remember them in our pendingTasks entry
+    stage.pendingPartitions.clear()
+
+    // First figure out the indexes of partition ids to compute.
+    val partitionsToCompute: Seq[Int] = stage.findMissingPartitions()
+
+    // Create internal accumulators if the stage has no accumulators initialized.
+    // Reset internal accumulators only if this stage is not partially submitted
+    // Otherwise, we may override existing accumulator values from some tasks
+    if (stage.internalAccumulators.isEmpty || stage.numPartitions == partitionsToCompute.size) {
+      stage.resetInternalAccumulators()
+    }
+
+    // Use the scheduling pool, job group, description, etc. from an ActiveJob associated
+    // with this Stage
+    val properties = jobIdToActiveJob(jobId).properties
+
+    runningStages += stage
+    // SparkListenerStageSubmitted should be posted before testing whether tasks are
+    // serializable. If tasks are not serializable, a SparkListenerStageCompleted event
+    // will be posted, which should always come after a corresponding SparkListenerStageSubmitted
+    // event.
+    stage match {
+      case s: ShuffleMapStage =>
+        outputCommitCoordinator.stageStart(stage = s.id, maxPartitionId = s.numPartitions - 1)
+      case s: ResultStage =>
+        outputCommitCoordinator.stageStart(
+          stage = s.id, maxPartitionId = s.rdd.partitions.length - 1)
+    }
+    val taskIdToLocations: Map[Int, Seq[TaskLocation]] = try {
+      stage match {
+        case s: ShuffleMapStage =>
+          partitionsToCompute.map { id => (id, getPreferredLocs(stage.rdd, id))}.toMap
+        case s: ResultStage =>
+          val job = s.activeJob.get
+          partitionsToCompute.map { id =>
+            val p = s.partitions(id)
+            (id, getPreferredLocs(stage.rdd, p))
+          }.toMap
+      }
+    } catch {
+      case NonFatal(e) =>
+        stage.makeNewStageAttempt(partitionsToCompute.size)
+        listenerBus.post(SparkListenerStageSubmitted(stage.latestInfo, properties))
+        abortStage(stage, s"Task creation failed: $e\n${e.getStackTraceString}", Some(e))
+        runningStages -= stage
+        return
+    }
+
+    stage.makeNewStageAttempt(partitionsToCompute.size, taskIdToLocations.values.toSeq)
+    listenerBus.post(SparkListenerStageSubmitted(stage.latestInfo, properties))
+
+    // TODO: Maybe we can keep the taskBinary in Stage to avoid serializing it multiple times.
+    // Broadcasted binary for the task, used to dispatch tasks to executors. Note that we broadcast
+    // the serialized copy of the RDD and for each task we will deserialize it, which means each
+    // task gets a different copy of the RDD. This provides stronger isolation between tasks that
+    // might modify state of objects referenced in their closures. This is necessary in Hadoop
+    // where the JobConf/Configuration object is not thread-safe.
+    var taskBinary: Broadcast[Array[Byte]] = null
+    try {
+      // For ShuffleMapTask, serialize and broadcast (rdd, shuffleDep).
+      // For ResultTask, serialize and broadcast (rdd, func).
+      val taskBinaryBytes: Array[Byte] = stage match {
+        case stage: ShuffleMapStage =>
+          closureSerializer.serialize((stage.rdd, stage.shuffleDep): AnyRef).array()//(stage.rdd,stage.shuffleDep):AnyRef 强制类型转换为AnyRef
+        case stage: ResultStage =>
+          closureSerializer.serialize((stage.rdd, stage.func): AnyRef).array()
+      }
+
+      taskBinary = sc.broadcast(taskBinaryBytes)
+    } catch {
+      // In the case of a failure during serialization, abort the stage.
+      case e: NotSerializableException =>
+        abortStage(stage, "Task not serializable: " + e.toString, Some(e))
+        runningStages -= stage
+
+        // Abort execution
+        return
+      case NonFatal(e) =>
+        abortStage(stage, s"Task serialization failed: $e\n${e.getStackTraceString}", Some(e))
+        runningStages -= stage
+        return
+    }
+
+    val tasks: Seq[Task[_]] = try {
+      stage match {
+        case stage: ShuffleMapStage =>
+          partitionsToCompute.map { id =>
+            val locs = taskIdToLocations(id)
+            val part = stage.rdd.partitions(id)
+            new ShuffleMapTask(stage.id, stage.latestInfo.attemptId,
+              taskBinary, part, locs, stage.internalAccumulators)
+          }
+
+        case stage: ResultStage =>
+          val job = stage.activeJob.get
+          partitionsToCompute.map { id =>
+            val p: Int = stage.partitions(id)
+            val part = stage.rdd.partitions(p)
+            val locs = taskIdToLocations(id)
+            new ResultTask(stage.id, stage.latestInfo.attemptId,
+              taskBinary, part, locs, id, stage.internalAccumulators)
+          }
+      }
+    } catch {
+      case NonFatal(e) =>
+        abortStage(stage, s"Task creation failed: $e\n${e.getStackTraceString}", Some(e))
+        runningStages -= stage
+        return
+    }
+
+    if (tasks.size > 0) {
+      logInfo("Submitting " + tasks.size + " missing tasks from " + stage + " (" + stage.rdd + ")")
+      stage.pendingPartitions ++= tasks.map(_.partitionId)
+      logDebug("New pending partitions: " + stage.pendingPartitions)
+      taskScheduler.submitTasks(new TaskSet(
+        tasks.toArray, stage.id, stage.latestInfo.attemptId, jobId, properties))
+      stage.latestInfo.submissionTime = Some(clock.getTimeMillis())
+    } else {
+      // Because we posted SparkListenerStageSubmitted earlier, we should mark
+      // the stage as completed here in case there are no tasks to run
+      markStageAsFinished(stage, None)
+
+      val debugString = stage match {
+        case stage: ShuffleMapStage =>
+          s"Stage ${stage} is actually done; " +
+            s"(available: ${stage.isAvailable}," +
+            s"available outputs: ${stage.numAvailableOutputs}," +
+            s"partitions: ${stage.numPartitions})"
+        case stage : ResultStage =>
+          s"Stage ${stage} is actually done; (partitions: ${stage.numPartitions})"
+      }
+      logDebug(debugString)
+    }
+  }
+```
+
+**10** taskScheduler.submitTasks(taskSet:TaskSet)提交stage生成的TaskSet,创建TaskSetManager管理Task状态，并将生成的TaskSetManager添加到调度队列中，当资源可用时调用schedulerBackend.reviveOffers()获取集群管理器中当前可用的调度资源，并提交task到合适的资源节点执行
+**10.1** 创建TaskSetManager 负责管理和调度TaskSet中的所有Task,追踪TaskSet中每个Task的状态，在有限的失败次数内重新提交失败的task,并通过延时执行来满足每个task的位置感知,当dagscheduler.resourcesOffers(...)收到可用worker资源时，会调用taskSetManager.resourceOffer(...),taskSetManager根据每个Task的位置感知算法来决定当前worker时候是满足task执行的位置，如果是就提交task到worker端执行，并监控task的执行结果。10.2 spark位置感知支持PROCESS_Local,NODE_LOCAL,NO_PREF,RACK_LOCAL,ANY,目前为止只支持Process_Local ***Spark 1.6.0***）
+在创建***TaskSetManager***是会调用addPendingTask(idx)顺序将所有task添加到相关位置感知数据结构中
+位置感知算法选择的顺序
+pendingTasksForExecutor//当task中TaskLocation为ExecutorCacheTaskLocation和HDFSCacheTaskLocation时，对应TaskLocality.PROCESS_LOCAL
+pendingTasksForHost//所有task都会添加，对应TaskLocality.NODE_LOCAL
+pendingTasksForRack//spark 1.6.0版本不支持机架感知模式,对应TaskLocality.RACK_LOCAL
+pendingTasksWithNoPrefs//当task没有设置TaskLocation时,对应TaskLocality.NO_PREF
+taskSetManager.DequeueTask(execId,host,allowLocality)中位置感知顺序和优先级为：**PROCESS_LOCAL->NODE_LOCAL->NO_PREF->RACK_LOCAL->ANY**
+**10.2** 当task.preferredLocations 返回的位置为ExecutorCacheTaskLocation、HDFSCacheTaskLocation和HostTaskLocation
+'TaskLocation'伴生对象中创建相应TaskLocation的算法
+```scala
+ def apply(str: String): TaskLocation = {
+    val hstr = str.stripPrefix(inMemoryLocationTag)
+    if (hstr.equals(str)) {
+      if (str.startsWith(executorLocationTag)) {
+        val splits = str.split("_")
+        if (splits.length != 3) {
+          throw new IllegalArgumentException("Illegal executor location format: " + str)
+        }
+        new ExecutorCacheTaskLocation(splits(1), splits(2))
+      } else {
+        new HostTaskLocation(str)
+      }
+    } else {
+      new HDFSCacheTaskLocation(hstr)
+    }
+  }
+```
+//task调度策略 SchedulerBuilder有两种FIFOSchedulerBuilder和FairSchedulerBuilder
+taskSchedulerBackend.resourceOffers(...)//通过第三方资源调度器提供资源
+taskScheduler.resourceOffers(...)//taskSchedulerBackend释放的资源根据task的信息提交task到各executor节点
+taskScheduler.resourceOfferSingleTaskSet(...)
+taskSetManager.resourceOffer(execId,host,maxLocality)
+**10.3** task的调度策略有两种类型FiFOScheduableBuilder(对应FIFOSchedulingAlgorithm算法)和FairSchedulableBuidler(对应FairSchedulingAlgorithm算法)，Fair算法核心为先调度TaskSetManager中剩余task数量少的那个TaskSetManager先执行
+
+Fair调度策略算法流程图
+![FairSchedulerAlgorithm](https://raw.githubusercontent.com/guoyang2011/spark-source-analysis/master/image/FairSchedulerAlgorithm.spark.jpg)
+Fair调度策略算法执行代码
+```scala
+override def comparator(s1: Schedulable, s2: Schedulable): Boolean = {
+    val minShare1 = s1.minShare
+    val minShare2 = s2.minShare
+    val runningTasks1 = s1.runningTasks
+    val runningTasks2 = s2.runningTasks
+    val s1Needy = runningTasks1 < minShare1
+    val s2Needy = runningTasks2 < minShare2
+    val minShareRatio1 = runningTasks1.toDouble / math.max(minShare1, 1.0).toDouble
+    val minShareRatio2 = runningTasks2.toDouble / math.max(minShare2, 1.0).toDouble
+    val taskToWeightRatio1 = runningTasks1.toDouble / s1.weight.toDouble
+    val taskToWeightRatio2 = runningTasks2.toDouble / s2.weight.toDouble
+    var compare: Int = 0
+
+    if (s1Needy && !s2Needy) {
+      return true
+    } else if (!s1Needy && s2Needy) {
+      return false
+    } else if (s1Needy && s2Needy) {
+      compare = minShareRatio1.compareTo(minShareRatio2)
+    } else {
+      compare = taskToWeightRatio1.compareTo(taskToWeightRatio2)
+    }
+
+    if (compare < 0) {
+      true
+    } else if (compare > 0) {
+      false
+    } else {
+      s1.name < s2.name
+    }
+  }
+```
+11. schedulerBackend.resourceOffers(...),当schedulerBackend收到资源调度器提供的一批可用资源，执行taskScheduler.resourcesOffers(...)根据调度算法选择[步骤10]()中添加到等待队列中的taskSetManager并选择taskSetManager中适合的task(根据Task的位置感知特性)到可用资源节点执行。
+函数调用过程：SchedulerBackend.resourceOffers(...)---->taskScheduler.resourcerOffers(...)--->taskScheduler.resourceOfferSingleTaskSet(...)--->taskSetManager.resourceOffer(...)--->taskSetManager.dequeueTask(...)[主要根据executorId,host，是否设置位置感知来选择合适的TaskSetManager中的Task]--->schedulerBackend.luanchTasks(...)
+
+taskScheduler.resouurceOffers(...)代码
+
+```scala
+def resourceOffers(offers: Seq[WorkerOffer]): Seq[Seq[TaskDescription]] = synchronized {
+    // Mark each slave as alive and remember its hostname
+    // Also track if new executor is added
+    var newExecAvail = false
+    for (o <- offers) {
+      executorIdToHost(o.executorId) = o.host
+      executorIdToTaskCount.getOrElseUpdate(o.executorId, 0)
+      if (!executorsByHost.contains(o.host)) {
+        executorsByHost(o.host) = new HashSet[String]()
+        executorAdded(o.executorId, o.host)
+        newExecAvail = true
+      }
+      for (rack <- getRackForHost(o.host)) {
+        hostsByRack.getOrElseUpdate(rack, new HashSet[String]()) += o.host
+      }
+    }
+
+    // Randomly shuffle offers to avoid always placing tasks on the same set of workers.
+    val shuffledOffers = Random.shuffle(offers)
+    // Build a list of tasks to assign to each worker.
+    val tasks = shuffledOffers.map(o => new ArrayBuffer[TaskDescription](o.cores))//设置数组初始大小为resource节点可用CPU数量，按照资源节点CPU核数创建可运行的task数量，一个CPU核对于一个Task,一个资源节点可能收到的task数大于CPU核数，因为task的位置感知原因。在taskSetManager.resourceOffers()选择
+    val availableCpus = shuffledOffers.map(o => o.cores).toArray
+    val sortedTaskSets = rootPool.getSortedTaskSetQueue
+    for (taskSet <- sortedTaskSets) {
+      logDebug("parentName: %s, name: %s, runningTasks: %s".format(
+        taskSet.parent.name, taskSet.name, taskSet.runningTasks))
+      if (newExecAvail) {
+        taskSet.executorAdded()
+      }
+    }
+
+    // Take each TaskSet in our scheduling order, and then offer it each node in increasing order
+    // of locality levels so that it gets a chance to launch local tasks on all of them.
+    // NOTE: the preferredLocality order: PROCESS_LOCAL, NODE_LOCAL, NO_PREF, RACK_LOCAL, ANY
+    var launchedTask = false
+    for (taskSet <- sortedTaskSets; maxLocality <- taskSet.myLocalityLevels) {
+      do {
+        launchedTask = resourceOfferSingleTaskSet(
+            taskSet, maxLocality, shuffledOffers, availableCpus, tasks)
+      } while (launchedTask)
+    }
+
+    if (tasks.size > 0) {
+      hasLaunchedTask = true
+    }
+    return tasks
+  }
+```
+taskScheduler.resourceOfferSingleTaskSet(...)源码
+```scala
+private def resourceOfferSingleTaskSet(
+      taskSet: TaskSetManager,
+      maxLocality: TaskLocality,
+      shuffledOffers: Seq[WorkerOffer],
+      availableCpus: Array[Int],
+      tasks: Seq[ArrayBuffer[TaskDescription]]) : Boolean = {
+    var launchedTask = false
+    for (i <- 0 until shuffledOffers.size) {
+      val execId = shuffledOffers(i).executorId
+      val host = shuffledOffers(i).host
+      if (availableCpus(i) >= CPUS_PER_TASK) {
+        try {
+          for (task <- taskSet.resourceOffer(execId, host, maxLocality)) {
+            tasks(i) += task
+            val tid = task.taskId
+            taskIdToTaskSetManager(tid) = taskSet
+            taskIdToExecutorId(tid) = execId
+            executorIdToTaskCount(execId) += 1
+            executorsByHost(host) += execId
+            availableCpus(i) -= CPUS_PER_TASK
+            assert(availableCpus(i) >= 0)
+            launchedTask = true
+          }
+        } catch {
+          case e: TaskNotSerializableException =>
+            logError(s"Resource offer failed, task set ${taskSet.name} was not serializable")
+            // Do not offer resources for this task, but don't throw an error to allow other
+            // task sets to be submitted.
+            return launchedTask
+        }
+      }
+    }
+    return launchedTask
+  }
+```
+------
+#slave节点Executor执行流程
+**1** MesosExecutorBackend.main(...),当Mesos Slave节点不存在执行Spark Driver提交任务的***Executor***时，Mesos slave根据***TaskInfo***中***ExecutorInfo***信息以命令行的形式创建***MesosExecutorBackend***和***MesosExecutorDriver***并初始化***MesosExecutorDriver***和***MesosExecutorDriver***
+**2** MesosExecutorBackend.registered(...)，在向Mesos创建***MesosExecutor***成功后，回调此方法返回注册成功的信息,包括 executor信息***ExecutorInfo***，框架信息***FrameworkInfo***和注册节点信息***SlaveInfo***。此时***MesosExecutorBackend***创建并初始化***Executor***，创建线程池用于调度和执行SparkDriver端提交的Tasks
+**3** MesosExecutorBackend.launchTask(...),Mesos向当前Executor发送Task任务，包含待执行任务详细信息***TaskInfo***。此时***Executor***根据***TaskInfo***创建***TaskRunner***，并将***TaskRunner***提交到***Executor***线程池中等待task被调度执行
+**4** ***Executor***线程池执行***TaskRunner***任务时,会将Task的执行状态和结果通过***MesosExecutorBackend.statusUpdate(...)***反馈给***MesosExecutorBackend***
+**5** ***MesosExecutorDriver.sendStatusUpdate(...)***，将收集到的Task状态转化为***TaskStatus***，发送给Spark Driver
+
+------
+>
+作者:[快鸟2016](https://fastbird2016.farbox.com)
+邮箱:<fastbird2016@gmail.com>
+更新时间：2016年04月14日
+spark 版本：1.6.1
+参考博客：
+**1.** [Mesos中Scheduler和SchedulerDriver API](http://fastbird2016.farbox.com/post/mesos/schedulerhe-schedulerdriver-api)
+**2.** [Mesos中Executor和ExecutorDriver API](http://fastbird2016.farbox.com/post/mesos/executorhe-executordriver-api)
+**3.** [Mesos的Framework和Executor注册过程](http://developer.51cto.com/art/201401/426500.htm)
+**4.** [Apache Mesos的任务状态更新过程分析](http://dongxicheng.org/apache-mesos/apache-mesos-task-status-update/)
+**5.** [Spark on Mesos: 粗粒度与细粒度实现分析](http://blog.csdn.net/pelick/article/details/43794833)
+>

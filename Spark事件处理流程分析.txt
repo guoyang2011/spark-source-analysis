@@ -1,0 +1,152 @@
+---
+date: 2016-04-11 17:49
+status: public
+title: Spark事件处理流程分析
+---
+
+###消息处理流程
+1.实现了***SparkListener***接口的消息监听者，首先会注册到消息总线[ListenerBus](#listenerBus)中。通过**addListener(listener:SparkListener)**方法，Listeners存储采用CopyOnWriteArrayList[SparkListener]。
+
+2.系统推送的***SparkListenerEvent***消息都会并发的发送到 [LiveListenerBus](#liveListenerBus)消息总线队列中,注意:消息队列中最大消息数量为1000，当队列中消息数大于1000时，将阻塞推送***SparkListenerEvent***消息的生产者。因此注册到消息总线上的***SparkListener***在消息处理过程中不应该阻塞和执行长时间任务。
+
+3.在消息总线***ListenerBus***中，会启动单独的线程轮训消息队列中的消息，并通过[SparkListenerBus.onPostEvent(listener,event)](#sparkListenerBus)方法将消息解析为相应消息类型后，推送到所有注册到消息总线线上的***SparkListener***进行处理。[SparkListenerBus.onPostEvent(listener,event)](#sparkListenerBus)的逻辑如下：
+```scala
+override def onPostEvent(listener: SparkListener, event: SparkListenerEvent): Unit = {
+    event match {
+      case stageSubmitted: SparkListenerStageSubmitted =>
+        listener.onStageSubmitted(stageSubmitted)
+      case stageCompleted: SparkListenerStageCompleted =>
+        listener.onStageCompleted(stageCompleted)
+      case jobStart: SparkListenerJobStart =>
+        listener.onJobStart(jobStart)
+      case jobEnd: SparkListenerJobEnd =>
+        listener.onJobEnd(jobEnd)
+      case taskStart: SparkListenerTaskStart =>
+        listener.onTaskStart(taskStart)
+      case taskGettingResult: SparkListenerTaskGettingResult =>
+        listener.onTaskGettingResult(taskGettingResult)
+      case taskEnd: SparkListenerTaskEnd =>
+        listener.onTaskEnd(taskEnd)
+      case environmentUpdate: SparkListenerEnvironmentUpdate =>
+        listener.onEnvironmentUpdate(environmentUpdate)
+      case blockManagerAdded: SparkListenerBlockManagerAdded =>
+        listener.onBlockManagerAdded(blockManagerAdded)
+      case blockManagerRemoved: SparkListenerBlockManagerRemoved =>
+        listener.onBlockManagerRemoved(blockManagerRemoved)
+      case unpersistRDD: SparkListenerUnpersistRDD =>
+        listener.onUnpersistRDD(unpersistRDD)
+      case applicationStart: SparkListenerApplicationStart =>
+        listener.onApplicationStart(applicationStart)
+      case applicationEnd: SparkListenerApplicationEnd =>
+        listener.onApplicationEnd(applicationEnd)
+      case metricsUpdate: SparkListenerExecutorMetricsUpdate =>
+        listener.onExecutorMetricsUpdate(metricsUpdate)
+      case executorAdded: SparkListenerExecutorAdded =>
+        listener.onExecutorAdded(executorAdded)
+      case executorRemoved: SparkListenerExecutorRemoved =>
+        listener.onExecutorRemoved(executorRemoved)
+      case blockUpdated: SparkListenerBlockUpdated =>
+        listener.onBlockUpdated(blockUpdated)
+      case logStart: SparkListenerLogStart => // ignore event log metadata
+    }
+  }
+```
+
+--------------
+###SparkListener中主要接口
+--------------
+####Application操作相关消息接口和消息类型
+```scala
+//当收到Application启动后监听到的消息
+case class SparkListenerApplicationStart(appName:String,appId:Option[String],time:Long,sparkUser:String,appAttempId:Option[String],driverLogs:Option[Map[String,String]])***
+```
+onApplicationStart(applicationStart:SparkListenerApplicationStart)
+```scala
+```
+onApplicationEnd(applicationEnd:SparkListenerApplicationEnd)
+
+--------------
+
+onJobStart(jobStart:SparkListenerJobStart)
+
+onJobEnd(jobEnd:SparkListenerJobEnd)
+
+--------------
+onStageSubmitted(stageSubmitted:SparkListenerStageSubmittted)
+
+onStageCompleted(stageCompleted:SparkListenerStageCompleted)
+
+--------------
+
+onTaskStart(taskStart:SparkListenerTaskStart)
+
+***//called when a task begins remotely fetching its result (will not be called for tasks that do not need to fetch the result remotely)***
+
+onTaskGettingResult(taskGettingResult:SparkListenerTaskGettingResult)
+
+onTaskEnd(taskEnd:SparkListenerTaskEnd)
+
+--------------
+onExecutorAdded(executorAdded:SparkListenerExecutorAdded)
+onExecutorMetricsUpdate(executorMetricsUpdate:SparkListenerMetricsUpdate)
+onExecutorRemoved(executorRemoved:SparkListenerExecutorRemoved)
+
+--------------
+onBlockManagerAdded(blockManagerAdded:SparkListenerBlockManagerAdded)
+onBlockManagerRemoved(blockManagerRemoved:SparkListenerBlockManagerRemoved)
+
+--------------
+onUnpersistRDD(unpersistRDD:SparkListenerUnpersistRDD)
+onBlockUpdated(blockUpdated:SparkListenerBlockUpdated)
+--------------
+###RDDOperationGraphListener[UI] 
+**for drawing Application DAG graph**
+
+A SparkListener that constructs a DAG of RDD operations
+```scala
+  // Note: the fate of jobs and stages are tied. This means when we clean up a job,
+  // we always clean up all of its stages. Similarly, when we clean up a stage, we
+  // always clean up its job (and, transitively, other stages in the same job).
+  private[ui] val jobIdToStageIds = new mutable.HashMap[Int, Seq[Int]]
+  private[ui] val jobIdToSkippedStageIds = new mutable.HashMap[Int, Seq[Int]]
+  private[ui] val stageIdToJobId = new mutable.HashMap[Int, Int]
+  private[ui] val stageIdToGraph = new mutable.HashMap[Int, RDDOperationGraph]
+  private[ui] val completedStageIds = new mutable.HashSet[Int]
+
+  // Keep track of the order in which these are inserted so we can remove old ones
+  private[ui] val jobIds = new mutable.ArrayBuffer[Int]
+  private[ui] val stageIds = new mutable.ArrayBuffer[Int]
+
+  // How many jobs or stages to retain graph metadata for
+  private val retainedJobs =
+    conf.getInt("spark.ui.retainedJobs", SparkUI.DEFAULT_RETAINED_JOBS)
+  private val retainedStages =
+    conf.getInt("spark.ui.retainedStages", SparkUI.DEFAULT_RETAINED_STAGES)
+
+```
+###-HeartbeatReceiver 
+Lives in the driver to receive heartbeats from executors，***HeartbeatReceicer***本身也是一个Actor,启动的时候回注册到***ListenerBus***上，收到的***SparkListener***消息最终会发送到***HeartbeatReceiver***邮箱***mailbox***中，并使用标准的Actor模型处理消息。在启动的时候***HeartbeatReceiver***会启动一个定时器定期检查***Executor***是否有超时，(未定期收到***Executor***的心跳包***Heartbeat***,默认定时时间为120s)，如果超时未收到某个Executor的心跳包，将向***SchedulerBackEnd***发出KillExecutor的请求,当***SchedulerBackEnd***实现为***CoarseGrainedSchedulerBackend***实现是会执行kill executor请求，并向worker发出kill executor请求。
+###-ExecutorAllocationListener
+A listener that notifies the given allocation manager of when to add or remove executors,主要属性如下主要属性
+```scala
+	private val stageIdToNumTasks = new mutable.HashMap[Int, Int]
+    private val stageIdToTaskIndices = new mutable.HashMap[Int, mutable.HashSet[Int]]
+    private val executorIdToTaskIds = new mutable.HashMap[String, mutable.HashSet[Long]]
+    // Number of tasks currently running on the cluster.  Should be 0 when no stages are active.
+    private var numRunningTasks: Int = _
+    // stageId to tuple (the number of task with locality preferences, a map where each pair is a
+    // node and the number of tasks that would like to be scheduled on that node) map,
+    // maintain the executor placement hints for each stage Id used by resource framework to better
+    // place the executors.
+    private val stageIdToExecutorPlacementHints = new mutable.HashMap[Int, (Int, Map[String, Int])]
+```
+
+###-ApplicationEventListener
+###-ExecutorListener
+###-JobProgressListener
+
+-------
+>作者:[快鸟2016](https://fastbird2016.farbox.com)
+邮箱:<fastbird2016@gmail.com>
+更新时间：2016年04月14日
+>

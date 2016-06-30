@@ -1,0 +1,87 @@
+---
+date: 2016-05-04 17:49
+status: public
+title: 'Scheduler和SchedulerDriver API'
+---
+
+#Mesos Scheduler API
+负责接收和处理Mesos的事件和消息的回调接口,所有接口都是回调接口且同一时间只有一个接口被回调，在自定义Executor的时候每个回调接口尽量不要长时间阻塞，Mesos内部可能导致死锁。主要接口：
+1. void registered(SchedulerDriver driver,FrameworkID frameworkId,MasterInfo masterInfo)
+当Scheduler向Mesos Master注册成功后回调，会返回唯一的frameworkId和master节点的信息masterInfo
+2. void reregistered(SchedulerDriver driver,MasterInfo masterInfo)
+当Mesos通过选举产生新的Master后回调，返回新的Master节点信息masterInfo
+3. void disconnected(SchedulerDriver driver)
+当Scheduler和Mesos Master节点断开连接后回调，可能原因为Master挂了或者Master换了
+4. void resourceOffers(SchedulerDriver driver ,List<Offer> offers)
+Mesos提供了一批可用资源给当前framework,当前scheduler可以使用或者拒绝Mesos提供的资源,每个Offer以slave为单位，即以slave为单位的资源列表。
+注意Mesos提供的资源同时可以被多个framework框架使用。当第一个framework使用资源执行task后，其他framework再使用此资源执行task会撤回。
+注意：当offer被分配任务后需要调用SchedulerDriver.declineOffer(offerId)向Mesos申请此资源已经被占用，剩余offer应该减去已经被此Scheduler使用offer
+5. void offerRescinded(SchedulerDriver driver,OfferId offerId)
+当使用的Offer不合法时回调，可能原因为slave节点断开或挂掉，其他framework已经只是用了此offer
+当framework尝试使用不合法的offer启动task会收到TASK_LOST消息
+6. void statusUpdate(SchedulerDriver driver,TaskStatus status)
+当在offer提供的节点上执行task,task的状态更新时回调，包括slave挂掉或者断开连接导致task lost的状态，task完成的状态(failed/succeeded)等
+7. void frameworkMessage(SchedulerDriver driver,ExecutorID executorId,SlaveID slaveId,String data)
+当收到Executor主动发送的消息时回调，Mesos内部提供的这种消息接口，貌似不稳定。
+8. void slaveLost(SchedulerDriver driver,SlaveID slaveId)
+当slave被检查到不可到达时回调,可能是slave节点物理机挂掉，网络问题。对于framework中有在此不可到达的slave执行的tasks，framework需要重新提交tasks到其他可用slave上执行
+9. void executorLost(SchedulerDriver driver,ExecutorID executorId,SlaveID slaveId,int status)
+当某个slave上的executor挂掉或退出后回调，注意在此Executor上执行的Task的framework都将收到TASK_LOST状态消息
+10.void error(SchedulerDriver driver,String message)
+当此framework中的scheduler和scheduler driver 组件发生异常或错误时回调。
+
+------
+#Mesos Scheduler Driver API
+作为Scheduler与Mesos之间的桥梁，负责管理Scheduler的生命周期(start,stop,等待结束等)和与Mesos Master建立通信(如launch tasks,kill tasks等),默认实现为***MesosSchedulerDriver***
+**1.** Status start()
+启动SchedulerDirver,必须在除了run接口之外的所有SchedulerDriver中接口调用之前执行。
+**2.** Status stop(boolean failover)
+停止SchedulerDriver，如果failover=false暗示当前的framework不会重连Mesos,此条件下Mesos可以注销此framework和停止此framework提交的所有tasks和executors。如果failover=true,此framework可以重新向Mesos注册，Mesos也会保留此framework正在运行的所有tasks和executors.
+**3.** Status abort()
+终止当前SchedulerDriver,如果终止了SchedulerDriver，Scheduler将不会再收到回调消息。abort和stop语义不同，abort在终止后可在当前应用中启动和实例化其他的driver。stop语义可以支持当前framework重新连接
+注意abort中不会执行stop方法
+**4.** Status join()
+等待SchedulerDriver停止stop和终止abort结束,返回的Status状态可以检测driver是否已经被终止aborted。
+**5.** Status run()
+用于启动当前SchedulerDriver,当启动失败后调用join接口立即进入阻塞等待
+MesosSchedulerDriver中实现代码
+```java
+public Status run() {
+    Status status = start();
+    return status != Status.DRIVER_RUNNING ? status : join();
+  }
+```
+**6.** Status requestResources(List<Request> requests)
+向Mesos请求特定的资源(如请求特定的slave节点资源,可以包含cpu，内存等信息)，如果请求的资源被分配给了当前framework，Mesos将回调Scheduler.resouceOffers(SchedulerDriver driver,List<Offer> offers)，Scheduler可用Mesos提供的资源执行Tasks
+注：Request结构参考[mesos.proto#Request](https://github.com/apache/mesos/blob/master/include/mesos/mesos.proto#Request)
+**7.** Status launchTasks(List<OfferID> offerIds,List<TaskInfo> tasks,Filters filters)
+向Mesos提供的资源提交Tasks
+注意一个offer中可以提交多个task，一个资源节点中剩余的资源offer需要减去已经分配的资源offer
+**8.** Status launchTasks(List<OfferID> offerIds,List<TaskInfo> tasks)
+使用默认的Filter提交Tasks
+**9.** Status killTask(TaskID taskId)
+根据taskId终止killExecutor端运行的task
+注意：目前Mesos 0.28.1调用killTask方法杀死task是不可靠的，可能由于当scheduler发生错误，需要重试killTask，或注销或者失去与Master的连接或Master与Slave之间的连接。
+**10.** Status acceptOffers(List<OfferID> offerIds,List<Offer.Operation> operations,Filters filters)
+获取Offer中执行连续的操作，操作包括(LAUCH,RESERVE,UNRESERVE,CREATE,DESTROY)详细信息参看(pesos.proto#Operation)[https://github.com/apache/mesos/blob/master/include/mesos/mesos.proto]。
+注意所有的offer都是在一个slave上分配的，当在offer提供的资源中执行操作时。slave上可用资源需要减去已经使用的资源
+**11.** Status declineOffer(OfferID offerId)
+将offerId对应的slave资源重新放到mesos资源池中由mesos重新分配给集群中framework使用
+**12.** Status reviveOffers()
+移除所有framework之前设置的filters,这样framework又可以从过滤的slave中接受资源
+**13.** Status suppressOffers()
+通知Mesos Master停止向当前framework发送集群中可用资源，scheduler可以重新调用reviveOffers()来重新向Mesos Master 获取可用资源
+**14.** Status acknowledgeStatusUpdate(TaskStatus status)
+应答task的状态更新
+注意确认的状态类型必须是TaskState(详细类型见[mesos.proto#TaskState](https://github.com/apache/mesos/blob/master/include/mesos/mesos.proto))中已经定义的，如果收到未定义的状态确认，将导致scheduler driver 崩溃
+**15.** Status sendFrameworkMessage(ExecutorID executorId,SlaveID slaveId,byte[] data)
+当前framework使用driver发送消息给slave中executor,消息语义为Fire-Forget，Mesos不保证消息的可靠性。
+**16.** Status reconcileTasks(List<TaskStatus> statuses)
+查询framework中正在运行的tasks的状态信息,Mesos Master将返回查询的tasks最新状态；如果statuses为空(注意不是null)，Mesos Master将返回所有当前framework正在运行的tasks的最新状态。
+
+------
+>作者:[快鸟2016](https://fastbird2016.farbox.com)
+邮箱:<fastbird2016@gmail.com>
+更新时间：2016年04月14日
+Mesos 版本：0.28.1
+>
